@@ -4,7 +4,7 @@ export type Language = 'en' | 'zh';
 export type Theme = 'dark' | 'light';
 
 const chinese: Record<string, string> = {
-  Trade: '交易', Strategy: '策略', 'Funding Rates': '资金费率', Portfolio: '资产', Settings: '设置', 'Main navigation': '主导航', More: '更多', 'More tools': '更多工具',
+  Trade: '交易', Arbitrage: '套利', Strategy: '策略', 'Funding Rates': '资金费率', Portfolio: '资产', Settings: '设置', 'Main navigation': '主导航', More: '更多', 'More tools': '更多工具',
   'Trading fee comparison': '交易手续费查询', 'Compare account fees by ticker': '按代币对比账户费率',
   'Trading tools': '交易工具', 'Enter a ticker to compare fees and estimated costs across every exchange that supports its perpetual contract.': '输入代币代码，对比所有支持该永续合约的交易所费率和预估成本。',
   'Current CrossEx account rates': '当前 CrossEx 账户费率', Ticker: '代币代码', 'Trade notional': '名义价值', 'Supported exchanges': '支持的交易所',

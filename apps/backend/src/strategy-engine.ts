@@ -72,6 +72,8 @@ interface StrategyActor {
   quiesceReason: string | null;
   createdAt: number;
   lastCloseAt: number;
+  adverseQuoteCount: number;
+  lastAdversePairKey: string | null;
 }
 
 interface LegDefinition {
@@ -678,7 +680,7 @@ export class StrategyEngine {
       busy: false, queue: Promise.resolve(), quotes: new Map(), repairAttempts: 0,
       lastRepairAt: 0, failureCount: 0, cooldownUntil: 0, lastQuoteAt: 0,
       suspended, quiesceTarget: null, quiesceReason: null, createdAt: Date.parse(record.createdAt),
-      lastCloseAt: Date.parse(record.updatedAt),
+      lastCloseAt: Date.parse(record.updatedAt), adverseQuoteCount: 0, lastAdversePairKey: null,
     };
     this.actors.set(record.id, actor);
     return actor;
@@ -1554,21 +1556,47 @@ export class StrategyEngine {
     const matched = this.matchedQuantity(exposure);
     const perOrder = new Decimal(actor.config.perOrderQuantity);
 
+    if (actor.kind === 'auto' && actor.config.takeProfitBps && matched.gt(QUANTITY_EPSILON)) {
+      const exitSpread = this.exitSpreadBps(actor.config);
+      if (!exitSpread) return;
+      if (exitSpread.lte(new Decimal(actor.config.takeProfitBps))) {
+        actor.adverseQuoteCount = 0;
+        actor.lastAdversePairKey = null;
+        const quantity = Decimal.min(perOrder, matched);
+        if (quantity.gt(QUANTITY_EPSILON)) {
+          await this.executeTakerClip(actor, 'exit', quantity, `Exit spread ${exitSpread.toFixed(2)} bps ≤ ${actor.config.takeProfitBps} bps`);
+        }
+        return;
+      }
+      const emergencyStop = new Decimal(actor.config.emergencyStopBps);
+      const pairKey = entry ? `${entry.sell.updatedAt}:${entry.buy.updatedAt}` : null;
+      if (exitSpread.gte(emergencyStop) && pairKey && pairKey !== actor.lastAdversePairKey) {
+        actor.adverseQuoteCount += 1;
+        actor.lastAdversePairKey = pairKey;
+      } else if (exitSpread.lt(emergencyStop)) {
+        actor.adverseQuoteCount = 0;
+        actor.lastAdversePairKey = null;
+      }
+      if (actor.adverseQuoteCount >= 3) {
+        actor.adverseQuoteCount = 0;
+        const quantity = Decimal.min(perOrder, matched);
+        if (quantity.gt(QUANTITY_EPSILON)) {
+          await this.executeTakerClip(actor, 'exit', quantity,
+            `Emergency stop: exit spread ${exitSpread.toFixed(2)} bps ≥ ${actor.config.emergencyStopBps} bps for 3 synchronized quotes`);
+          if (this.actors.has(actor.id) && actor.status === 'RUNNING') {
+            await this.pause(actor, 'Emergency stop executed after three distinct synchronized adverse quotes; manual review required before re-entry');
+          }
+        }
+        return;
+      }
+    }
+
     if (entry && entry.spread.gte(new Decimal(actor.config.entryBps ?? '0'))) {
       const capacity = this.remainingEntryCapacity(actor, exposure);
       const quantity = Decimal.min(perOrder, capacity);
       if (quantity.gt(QUANTITY_EPSILON)) {
         await this.executeTakerClip(actor, 'entry', quantity, `Spread ${entry.spread.toFixed(2)} bps ≥ ${actor.config.entryBps} bps`);
         return;
-      }
-    }
-    if (actor.kind === 'auto' && actor.config.takeProfitBps && matched.gt(QUANTITY_EPSILON)) {
-      const exitSpread = this.exitSpreadBps(actor.config);
-      if (exitSpread && exitSpread.lte(new Decimal(actor.config.takeProfitBps))) {
-        const quantity = Decimal.min(perOrder, matched);
-        if (quantity.gt(QUANTITY_EPSILON)) {
-          await this.executeTakerClip(actor, 'exit', quantity, `Exit spread ${exitSpread.toFixed(2)} bps ≤ ${actor.config.takeProfitBps} bps`);
-        }
       }
     }
   }
@@ -1598,7 +1626,8 @@ export class StrategyEngine {
     actor.busy = true;
     try {
       const reduceOnly = intent === 'exit' || actor.config.reduceOnly;
-      const triggeredEvent = intent === 'exit' ? 'Take-profit triggered'
+      const emergencyExit = intent === 'exit' && condition.startsWith('Emergency stop:');
+      const triggeredEvent = emergencyExit ? 'Emergency stop triggered' : intent === 'exit' ? 'Take-profit triggered'
         : actor.config.reduceOnly ? 'Reduce-only triggered' : 'Entry triggered';
       this.runtime.addStrategyLog(actor.id, 'info', triggeredEvent, condition,
         `${quantity.toString()} ${actor.config.asset}`, 'Submitting both taker legs');
@@ -1635,7 +1664,7 @@ export class StrategyEngine {
       const left = settled.find((order) => order.strategyLeg === 'left');
       const right = settled.find((order) => order.strategyLeg === 'right');
       if (left?.state === 'FILLED' && right?.state === 'FILLED') {
-        const executedEvent = intent === 'exit' ? 'Take-profit Executed'
+        const executedEvent = emergencyExit ? 'Emergency stop Executed' : intent === 'exit' ? 'Take-profit Executed'
           : actor.config.reduceOnly ? 'Reduce-only Executed' : 'Position open Executed';
         this.runtime.addStrategyLog(actor.id, 'info',
           executedEvent,

@@ -15,12 +15,12 @@ interface HubHarness {
 
 const harnesses: HubHarness[] = [];
 
-async function createHubHarness(): Promise<HubHarness> {
+async function createHubHarness(options: { orderBookIdleMs?: number } = {}): Promise<HubHarness> {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await new Promise<void>((resolve) => server.once('listening', resolve));
   const address = server.address();
   if (typeof address === 'string' || !address) throw new Error('missing server address');
-  const hub = new CrossExMarketHub(`ws://127.0.0.1:${address.port}`);
+  const hub = new CrossExMarketHub(`ws://127.0.0.1:${address.port}`, options);
   const received: Array<Record<string, unknown>> = [];
   const messages: MarketHubMessage[] = [];
   hub.subscribe((message) => messages.push(message));
@@ -221,7 +221,7 @@ describe('CrossEx dynamic market channels', () => {
   });
 
   it('maintains an incremental order book with refcounted upstream subscriptions', async () => {
-    const { hub, socket, received, messages } = await createHubHarness();
+    const { hub, socket, received, messages } = await createHubHarness({ orderBookIdleMs: 25 });
     await waitFor(() => received.some((message) => message.channel === 'ticker'));
 
     const releaseFirst = hub.watchOrderBook('GATE_FUTURE_BTC_USDT');

@@ -685,6 +685,64 @@ export const VenueFeeRatesResponseSchema = z.object({
 });
 export type VenueFeeRatesResponse = z.infer<typeof VenueFeeRatesResponseSchema>;
 
+export const ArbitrageOpportunitySchema = z.object({
+  asset: z.string(),
+  marketClass: z.enum(['crypto', 'hong_kong', 'china_a']),
+  longVenue: z.string(),
+  shortVenue: z.string(),
+  longSymbol: z.string(),
+  shortSymbol: z.string(),
+  longAsk: z.string(),
+  shortBid: z.string(),
+  entrySpreadBps: z.number().finite(),
+  exitSpreadBps: z.number().finite(),
+  fundingSpread8hBps: z.number().finite().nullable(),
+  scenarioFundingAprPct: z.number().finite().nullable(),
+  roundTripFeeBps: z.number().finite().nonnegative().nullable(),
+  netEdge24hBps: z.number().finite().nullable(),
+  quoteSkewMs: z.number().int().nonnegative(),
+  oldestQuoteAgeMs: z.number().int().nonnegative(),
+  estimatedMarginUsd: z.number().finite().positive(),
+  executable: z.boolean(),
+  blockers: z.array(z.enum([
+    'market_stream_unhealthy', 'demo_quote', 'stale_quote', 'quote_skew',
+    'invalid_book', 'cross_venue_price_dislocation', 'entry_spread_nonpositive', 'funding_unavailable', 'fee_unavailable', 'negative_24h_edge',
+  ])),
+});
+export type ArbitrageOpportunity = z.infer<typeof ArbitrageOpportunitySchema>;
+
+export const ArbitrageOpportunitiesResponseSchema = z.object({
+  opportunities: z.array(ArbitrageOpportunitySchema),
+  coverage: z.array(z.object({
+    asset: z.string(),
+    marketClass: z.enum(['crypto', 'hong_kong', 'china_a']),
+    venues: z.array(z.string()),
+    streamed: z.boolean(),
+    arbitrageEligible: z.boolean(),
+    quotes: z.array(z.object({
+      venue: z.string(),
+      symbol: z.string(),
+      lastPrice: z.string().nullable(),
+      bidPrice: z.string().nullable(),
+      askPrice: z.string().nullable(),
+      updatedAt: z.string().nullable(),
+      live: z.boolean(),
+    })),
+  })),
+  fetchedAt: z.string(),
+  assumptions: z.object({
+    notionalPerLegUsd: z.number().finite().positive(),
+    leverage: z.number().finite().positive(),
+    holdingHours: z.number().finite().positive(),
+    maxQuoteAgeMs: z.number().int().positive(),
+    maxQuoteSkewMs: z.number().int().positive(),
+    feeMode: z.literal('taker_round_trip'),
+    annualization: z.literal('current_8h_rate_unchanged_scenario'),
+    marketClass: z.enum(['all', 'crypto', 'hong_kong', 'china_a']),
+  }),
+});
+export type ArbitrageOpportunitiesResponse = z.infer<typeof ArbitrageOpportunitiesResponseSchema>;
+
 export const LiveBalanceSchema = z.object({
   venue: z.string(),
   coin: z.string(),
@@ -913,6 +971,7 @@ export const StrategyConfigSchema = z.object({
   /** Paired funding-arbitrage strategies may use a negative spread as their maximum opening cost. */
   entryBps: SignedDecimalTextSchema.optional(),
   takeProfitBps: PositiveDecimalTextSchema.optional(),
+  emergencyStopBps: PositiveDecimalTextSchema.optional(),
   entryPremiumPct: SignedDecimalTextSchema.optional(),
   takeProfitPremiumPct: SignedDecimalTextSchema.optional(),
   grid: z.boolean().optional(),

@@ -364,6 +364,7 @@ interface TestContext {
   vault: CredentialVault;
   gateway: FakeCrossExGateway;
   publicMarketGateway: FakePublicMarketGateway;
+  marketHub?: CrossExMarketHub;
   tradingSession: TradingSession;
   directory: string;
 }
@@ -405,7 +406,7 @@ async function createTestApp(options: {
     borosMarketFeeFetcher: options.borosMarketFeeFetcher,
     logger: false,
   });
-  const context = { app, database, vault, gateway, publicMarketGateway, tradingSession, directory };
+  const context = { app, database, vault, gateway, publicMarketGateway, tradingSession, directory, marketHub: options.marketHub };
   resources.push(context);
   return context;
 }
@@ -1063,6 +1064,42 @@ describe('local backend', () => {
     expect(unknown.statusCode).toBe(404);
     const invalid = await app.inject({ method: 'GET', url: '/api/markets/GATE_FUTURE_BTC_USDT/candles?interval=7w', headers });
     expect(invalid.statusCode).toBe(400);
+  });
+
+  it('exposes a bounded read-only order-book endpoint without seed-price fallback', async () => {
+    const { app } = await createTestApp();
+    const headers = { host: '127.0.0.1:17840' };
+
+    const unavailable = await app.inject({
+      method: 'GET', url: '/api/markets/BINANCE_FUTURE_BTC_USDT/orderbook?waitMs=0', headers,
+    });
+    expect(unavailable.statusCode).toBe(503);
+    expect(unavailable.json()).toEqual({ error: 'orderbook_unavailable' });
+
+    const invalid = await app.inject({
+      method: 'GET', url: '/api/markets/LIGHTER_FUTURE_BTC_USDT/orderbook?waitMs=0', headers,
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toEqual({ error: 'invalid_orderbook_request' });
+  });
+
+  it('serves a live ticker BBO without opening a cold depth subscription', async () => {
+    const marketHub = new CrossExMarketHub('ws://127.0.0.1:1');
+    const { app } = await createTestApp({ marketHub });
+    const liveMarket = marketHub.market('BINANCE_FUTURE_BTC_USDT');
+    expect(liveMarket).not.toBeNull();
+    Object.assign(liveMarket!, {
+      bidPrice: '63600', bidSize: '2.5', askPrice: '63601', askSize: '1.75',
+      updatedAt: new Date().toISOString(), source: 'gate_crossex_websocket',
+    });
+    const response = await app.inject({
+      method: 'GET', url: '/api/markets/BINANCE_FUTURE_BTC_USDT/orderbook?waitMs=0',
+      headers: { host: '127.0.0.1:17840' },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      bids: [['63600', '2.5']], asks: [['63601', '1.75']], source: 'gate_crossex_websocket',
+    });
   });
 
   it('keeps serving the candle route when the venue backfill fails, without an unhandled rejection', async () => {

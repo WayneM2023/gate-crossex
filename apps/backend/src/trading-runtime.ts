@@ -22,6 +22,7 @@ const CreateOrderInputSchema = z.object({
   price: decimalText.optional(),
   reduceOnly: z.boolean().default(false),
   positionSide: z.enum(['NONE', 'LONG', 'SHORT']).default('NONE'),
+  clientOrderId: z.string().regex(/^sp-[a-z0-9-]{8,80}$/).optional(),
 }).superRefine((value, context) => {
   if (value.type === 'LIMIT' && !value.price) context.addIssue({ code: 'custom', path: ['price'], message: 'price is required for limit orders' });
 });
@@ -48,6 +49,8 @@ export const CreateStrategyInputSchema = z.object({
   /** Position strategies may accept a bounded opening cost, represented by a negative spread. */
   entryBps: signedDecimalText.optional(),
   takeProfitBps: decimalText.optional(),
+  /** Emergency convergence failure: close after three synchronized quotes at or above this spread. */
+  emergencyStopBps: decimalText.default('100000'),
   /** premium: absolute premium levels in percent; signed because ADRs can trade at a discount. */
   entryPremiumPct: signedDecimalText.optional(),
   takeProfitPremiumPct: signedDecimalText.optional(),
@@ -86,6 +89,10 @@ export const CreateStrategyInputSchema = z.object({
   }
   if (value.kind === 'position' && !value.totalAmount) context.addIssue({ code: 'custom', path: ['totalAmount'], message: 'total amount is required' });
   if (value.kind === 'auto' && (!value.maxPosition || !value.takeProfitBps)) context.addIssue({ code: 'custom', path: ['maxPosition'], message: 'max position and take profit are required' });
+  if (value.kind === 'auto' && value.entryBps && value.emergencyStopBps && new Decimal(value.emergencyStopBps).lte(value.entryBps)) {
+    context.addIssue({ code: 'custom', path: ['emergencyStopBps'], message: 'emergency stop must be above entry' });
+  }
+  if (value.kind === 'auto' && value.executionMethod !== 'TAKER_TAKER') context.addIssue({ code: 'custom', path: ['executionMethod'], message: 'auto strategies with emergency stops execute taker-taker' });
   if (value.executionMethod === 'MAKER_TAKER' && !value.makerLeg) context.addIssue({ code: 'custom', path: ['makerLeg'], message: 'maker leg is required' });
   if (value.kind !== 'premium' && value.hedgeMode === 'EQUAL_NOTIONAL') context.addIssue({ code: 'custom', path: ['hedgeMode'], message: 'equal-notional hedging is a premium-strategy option' });
   if (value.kind === 'premium') {
@@ -793,7 +800,7 @@ export class TradingRuntime {
         throw new TradingRuntimeError('order_position_exceeds_leverage_limit', 409);
       }
     }
-    const clientOrderId = `gct-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const clientOrderId = input.clientOrderId ?? `gct-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const gateInput = CrossExOrderRequestSchema.parse({ text: clientOrderId, symbol: input.symbol, side: input.side,
       type: input.type, time_in_force: input.timeInForce, qty: input.quantity, price: input.price,
       reduce_only: input.reduceOnly ? 'true' : 'false', position_side: input.positionSide });

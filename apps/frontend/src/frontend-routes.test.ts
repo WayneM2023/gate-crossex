@@ -11,6 +11,8 @@ describe('frontend routes', () => {
     { workspace: 'Funding Rates', asset: null },
     { workspace: 'Funding Rates', asset: 'BTC' },
     { workspace: 'Portfolio' },
+    { workspace: 'Arbitrage' },
+    { workspace: 'Spread' },
     { workspace: 'Trading Fees' },
   ];
 

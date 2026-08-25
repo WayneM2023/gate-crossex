@@ -19,6 +19,9 @@ export interface PairedPositionPrefill {
   asset: string;
   longVenue: ExchangeLogoId;
   shortVenue: ExchangeLogoId;
+  entryBps?: string;
+  takeProfitBps?: string;
+  emergencyStopBps?: string;
 }
 
 export const DIALOG_FOCUSABLE = [

@@ -40,11 +40,13 @@ const FundingDetailView = lazy(() => import('./funding-route.js').then((module) 
 const FundingRatesView = lazy(() => import('./funding-route.js').then((module) => ({ default: module.FundingRatesView })));
 const PortfolioView = lazy(() => import('./portfolio-route.js').then((module) => ({ default: module.PortfolioView })));
 const FeeComparisonView = lazy(() => import('./fee-comparison-route.js').then((module) => ({ default: module.FeeComparisonView })));
+const SpreadView = lazy(() => import('./spread-route.js').then((module) => ({ default: module.SpreadView })));
+const ArbitrageView = lazy(() => import('./arbitrage-route.js').then((module) => ({ default: module.ArbitrageView })));
 const SOURCE_CODE_URL = 'https://github.com/your-quantguy/gate-crossex';
 const LICENSE_URL = `${SOURCE_CODE_URL}/blob/main/LICENSE`;
 const RELEASE_VERSION = `v${import.meta.env.VITE_APP_VERSION}`;
 
-type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees';
+type Workspace = 'Trade' | 'Strategy' | 'Funding Rates' | 'Portfolio' | 'Trading Fees' | 'Spread' | 'Arbitrage';
 type NavigationLabel = Workspace | 'Boros by Pendle';
 type StrategyKind = StrategyRouteKind;
 /** Matches the backend's market-catalog freshness window; switches inside it reuse client state. */
@@ -54,6 +56,7 @@ type FundingHistoryCache = Record<FundingHistoryDuration, Record<string, Funding
 
 const navItems: { label: NavigationLabel; glyph: string }[] = [
   { label: 'Trade', glyph: '⌁' },
+  { label: 'Arbitrage', glyph: '⇆' },
   { label: 'Strategy', glyph: '⇄' },
   { label: 'Funding Rates', glyph: '%' },
   { label: 'Boros by Pendle', glyph: '◐' },
@@ -1037,9 +1040,14 @@ function App() {
     navigate({ workspace: 'Strategy', strategyKind: 'position' });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [navigate]);
+  const openArbitrageStrategy = useCallback((prefill: PairedPositionPrefill) => {
+    setPositionPrefill(prefill);
+    navigate({ workspace: 'Strategy', strategyKind: 'auto' });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [navigate]);
 
   useEffect(() => {
-    if (route.workspace !== 'Strategy' || route.strategyKind !== 'position') setPositionPrefill(null);
+    if (route.workspace !== 'Strategy' || (route.strategyKind !== 'position' && route.strategyKind !== 'auto')) setPositionPrefill(null);
   }, [route]);
   const availableCatalog = useMemo(
     () => catalog ?? fallbackCatalogFromSnapshot(marketSnapshot),
@@ -1062,9 +1070,11 @@ function App() {
       : <FundingRatesView metric={fundingMetric} onMetricChange={setFundingMetric} marketSnapshot={marketSnapshot} onMarketFallback={refreshMarketSnapshot} onOpenAsset={openFundingDetail} onOpenStrategy={openFundingStrategy} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} fundingHistoryCache={fundingHistoryCache} onFundingHistoryEntries={mergeFundingHistory} />;
     if (workspace === 'Portfolio') return <PortfolioView key={connection?.activeProfileId ?? 'no-active-account'} tradingSnapshot={tradingSnapshot} balances={balances} portfolio={authenticatedPortfolio} accountStream={accountStream} tradingMode={tradingMode} onOpenModeDialog={openModeDialog} onRefresh={refreshAuthenticatedPortfolio} />;
     if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} />;
+    if (workspace === 'Arbitrage') return <ArbitrageView onConfigure={openArbitrageStrategy} />;
+    if (workspace === 'Spread') return <SpreadView />;
     return null;
 
-  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, mergeFundingHistory, navigate, connection?.activeProfileId]);
+  }, [workspace, strategyKind, positionPrefill, selectedAsset, fundingMetric, fundingOverview, fundingHistoryCache, availableCatalog, selectAsset, marketSnapshot, tradingSnapshot, authenticatedPortfolio, accountStream, activeAccountStrategies, balances, fees, feesReady, feesError, orderBook, publicTrades, candleSeries, candleBackfilling, tradingMode, openModeDialog, watchMarket, watchQuotes, watchKlines, seedCandles, refreshTrading, refreshStrategies, refreshPositions, refreshMarketSnapshot, refreshFees, favorites, toggleFavorite, confirmOrders, fundingDetailAsset, openFundingDetail, openFundingStrategy, openArbitrageStrategy, mergeFundingHistory, navigate, connection?.activeProfileId]);
 
   const storageLabel = connection?.storage === 'os_keychain' ? t('OS keychain') : connection?.storage === 'env_file' ? t('Local .env file') : connection?.storage ?? '—';
   const accountStatusLabel = accountStream?.state === 'live' ? t('Account live')
@@ -1269,6 +1279,8 @@ function App() {
         : <button key={item.label} className={`topbar-navigation-button ${item.label === 'Boros by Pendle' ? workspace === 'Strategy' && strategyKind === 'boros' ? 'active' : '' : workspace === item.label ? 'active' : ''}`} onClick={() => {
           navigate(item.label === 'Trade'
             ? { workspace: 'Trade' }
+            : item.label === 'Arbitrage'
+              ? { workspace: 'Arbitrage' }
             : item.label === 'Boros by Pendle'
               ? { workspace: 'Strategy', strategyKind: 'boros' }
             : item.label === 'Funding Rates'
@@ -1294,6 +1306,11 @@ function App() {
               setMoreMenuAt(null);
               moreTriggerRef.current?.focus();
             }}><strong>{t('Trading fee comparison')}</strong><small>{t('Compare account fees by ticker')}</small></button></li>
+            <li role="none"><button role="menuitem" className={workspace === 'Spread' ? 'selected' : ''} onClick={() => {
+              navigate({ workspace: 'Spread' });
+              setMoreMenuAt(null);
+              moreTriggerRef.current?.focus();
+            }}><strong>Spread Monitor</strong><small>查看套利仓位、PNL 与候选机会</small></button></li>
           </ul>}
         </div>
       </nav>

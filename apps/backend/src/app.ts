@@ -25,6 +25,7 @@ import {
 } from '@gate-crossex/shared-types';
 import type {
   BorosStrategiesResponse,
+  ArbitrageOpportunitiesResponse,
   CandleInterval,
   CandleSeriesResponse,
   CredentialConnectionStatus,
@@ -67,6 +68,8 @@ import { GateApiError, type GateCrossExAccount, type GateCrossExPortfolio, type 
 import { CandleStore } from './candle-store.js';
 import { FundingHistoryService } from './funding-history.js';
 import { FundingOverviewService } from './funding-overview.js';
+import { buildArbitrageOpportunities } from './arbitrage-opportunities.js';
+import { matchesMarketClass, marketClassOf } from './equity-markets.js';
 import { canonicalMarketAsset } from './market-asset-aliases.js';
 import { CrossExMarketHub, CANDLE_INTERVALS, type MarketDefinition, type MarketHubMessage } from './market-hub.js';
 import { StrategyEngine, StrategyEngineError } from './strategy-engine.js';
@@ -570,6 +573,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }
   const marketHub = options.marketHub ?? new CrossExMarketHub(config.gatePublicWebSocketUrl);
   const tradingSession = options.tradingSession ?? new TradingSession();
+  const forceReadonly = process.env.GCT_FORCE_READONLY === '1';
+  if (forceReadonly) tradingSession.set('readonly');
   const credentialOperationGate = new CredentialOperationGate();
   const runAuthenticatedWrite = async <T>(work: () => Promise<T>): Promise<T> => {
     try {
@@ -626,6 +631,45 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     generation: number;
     promise: Promise<{ fees: VenueFeeRatesResponse['fees']; fetchedAt: string }>;
   } | null = null;
+  const loadFeeRates = async (): Promise<{ fees: VenueFeeRatesResponse['fees']; fetchedAt: string }> => {
+    if (feeCache && Date.now() - Date.parse(feeCache.fetchedAt) < 10 * 60_000) return feeCache;
+    const tradingGateway = crossExGateway as Partial<TradingCrossExGateway>;
+    if (!tradingGateway.queryFeeRates) throw new TradingRuntimeError('fee_rates_unavailable', 503);
+    if (feeFetchInFlight?.generation !== credentialGeneration) {
+      const refreshCredentialGeneration = credentialGeneration;
+      const pending = (async () => {
+        let credentials: GateCredentials | null = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        try {
+          if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+          const rates = await tradingGateway.queryFeeRates!(credentials);
+          if (refreshCredentialGeneration !== credentialGeneration) {
+            throw new TradingRuntimeError('credential_context_changed', 409);
+          }
+          const refreshed = {
+            fetchedAt: new Date().toISOString(),
+            fees: rates.map((rate) => ({
+              venue: rate.exchange_type, spotMakerFee: rate.spot_maker_fee, spotTakerFee: rate.spot_taker_fee,
+              futureMakerFee: rate.future_maker_fee, futureTakerFee: rate.future_taker_fee,
+              specialFees: (rate.special_fee_list ?? []).map((special) => ({
+                symbol: special.symbol,
+                makerFee: special.maker_fee_rate,
+                takerFee: special.taker_fee_rate,
+              })),
+            })),
+          };
+          feeCache = refreshed;
+          return refreshed;
+        } finally {
+          credentials = null;
+        }
+      })();
+      const completed = pending.finally(() => {
+        if (feeFetchInFlight?.promise === completed) feeFetchInFlight = null;
+      });
+      feeFetchInFlight = { generation: refreshCredentialGeneration, promise: completed };
+    }
+    return feeFetchInFlight.promise;
+  };
   let transferCoinCache: { items: CrossExTransferCoinsResponse['items']; fetchedAt: string } | null = null;
   let transferCoinFetchInFlight: Promise<{ items: CrossExTransferCoinsResponse['items']; fetchedAt: string }> | null = null;
   let sizeUnitCache: { units: Record<string, string>; fetchedAt: string; complete: boolean; marketCount: number } | null = null;
@@ -885,6 +929,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     );
     app.get('/', sendFrontend);
     app.get('/portfolio', sendFrontend);
+    app.get('/arbitrage', sendFrontend);
+    app.get('/spread', sendFrontend);
     app.get('/funding-rates', sendFrontend);
     app.get('/funding-rates/:asset', async (request, reply) => {
       const parsed = z.object({ asset: z.string().regex(/^[A-Z0-9]{1,20}$/i) }).safeParse(request.params);
@@ -1312,6 +1358,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }, async (request, reply) => {
     const parsed = z.object({ mode: z.enum(['readonly', 'live']), acceptDisclaimer: z.boolean().default(false) }).safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_trading_mode' });
+    if (forceReadonly && parsed.data.mode === 'live') {
+      return reply.code(403).send({ error: 'server_forced_readonly' });
+    }
     // Leaving the boot-time 'unset' state in any direction, or arming live trading from any
     // state, requires a fresh human acknowledgement of the risk disclaimer. The one transition
     // that must never be gated is live → readonly: locking is the safety action.
@@ -1405,6 +1454,67 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   app.get('/api/markets', async () => marketHub.snapshot());
 
+  app.get('/api/spread/overview', async (_request, reply) => {
+    try {
+      const response = await fetch(process.env.SPREAD_MONITOR_URL ?? 'http://127.0.0.1:17841/overview', {
+        signal: AbortSignal.timeout(2_000),
+      });
+      if (!response.ok) return reply.code(502).send({ error: 'spread_monitor_unavailable' });
+      reply.header('Cache-Control', 'no-store, max-age=0');
+      return await response.json();
+    } catch {
+      return reply.code(502).send({ error: 'spread_monitor_unavailable' });
+    }
+  });
+
+  const MarketOrderBookQuerySchema = z.object({
+    waitMs: z.coerce.number().int().min(0).max(3_000).default(1_500),
+    depth: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
+  });
+
+  app.get('/api/markets/:symbol/orderbook', {
+    // The local Spread scanner evaluates a broad universe in one synchronized
+    // tick. Keep write/auth routes on their narrow limits, but allow the
+    // loopback-only, read-only order-book fanout to complete without tripping
+    // the browser-oriented global 120 requests/minute ceiling.
+    config: { rateLimit: { max: 1_000, timeWindow: '1 minute' } },
+  }, async (request, reply) => {
+    const symbol = MarketWatchSymbolSchema.safeParse((request.params as { symbol?: unknown }).symbol);
+    const query = MarketOrderBookQuerySchema.safeParse(request.query ?? {});
+    if (!symbol.success || !query.success) return reply.code(400).send({ error: 'invalid_orderbook_request' });
+    if (!ensureMarketKnown(symbol.data)) return reply.code(404).send({ error: 'unknown_market_symbol' });
+    // The ticker channel is the always-on, scalable BBO feed. It is sufficient for
+    // scanners and remains conservative for execution because consumers must prove
+    // that the displayed top-level size covers the entire requested quantity.
+    const quote = marketHub.market(symbol.data);
+    if (!query.data.depth && quote?.source === 'gate_crossex_websocket'
+      && Number(quote.bidPrice) > 0 && Number(quote.bidSize) > 0
+      && Number(quote.askPrice) > 0 && Number(quote.askSize) > 0) {
+      reply.header('Cache-Control', 'no-store, max-age=0');
+      return {
+        symbol: symbol.data,
+        bids: [[quote.bidPrice, quote.bidSize]],
+        asks: [[quote.askPrice, quote.askSize]],
+        updatedAt: quote.updatedAt,
+        source: 'gate_crossex_websocket' as const,
+      };
+    }
+    const release = marketHub.watchOrderBook(symbol.data);
+    try {
+      const deadline = Date.now() + query.data.waitMs;
+      let book = marketHub.orderBook(symbol.data);
+      while (!book && Date.now() < deadline) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, Math.min(25, deadline - Date.now())));
+        book = marketHub.orderBook(symbol.data);
+      }
+      if (!book) return reply.code(503).send({ error: 'orderbook_unavailable' });
+      reply.header('Cache-Control', 'no-store, max-age=0');
+      return book;
+    } finally {
+      release();
+    }
+  });
+
   app.get('/api/boros/strategies', {
     config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
   }, async (request, reply) => {
@@ -1419,6 +1529,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
 
   app.get('/api/trading/snapshot', async () => tradingRuntime.snapshot());
+
+  app.get('/api/trading/orders/:id', async (request, reply) => {
+    const parsed = z.object({ id: z.string().uuid() }).safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_order_id' });
+    try { return tradingRuntime.getOrder(parsed.data.id); }
+    catch (error) {
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
+      return reply.code(500).send({ error: 'order_lookup_failed' });
+    }
+  });
 
   app.get('/api/trading/leverage/:symbol', {
     config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
@@ -1928,6 +2048,76 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return fundingOverviewService.buildResponse(catalog) satisfies FundingOverviewResponse;
   });
 
+  app.get('/api/arbitrage/opportunities', async (request, reply) => {
+    const parsedQuery = z.object({
+      notional: z.coerce.number().positive().max(10_000_000).default(1_000),
+      leverage: z.coerce.number().positive().max(100).default(3),
+      holdingHours: z.coerce.number().positive().max(24 * 30).default(24),
+      limit: z.coerce.number().int().positive().max(500).default(100),
+      marketClass: z.enum(['all', 'crypto', 'hong_kong', 'china_a']).default('crypto'),
+    }).safeParse(request.query);
+    if (!parsedQuery.success) return reply.code(400).send({ error: 'invalid_arbitrage_query' });
+    let catalog = derivedMarketCatalog();
+    if (!catalog) {
+      try {
+        await fetchInstrumentCatalog();
+        catalog = derivedMarketCatalog();
+      } catch (error) {
+        request.log.warn({ reason: error instanceof GateApiError ? error.label : 'PUBLIC_DATA_ERROR' }, 'arbitrage catalog discovery failed');
+      }
+      if (!catalog) return reply.code(502).send({ error: 'market_catalog_unavailable' });
+    }
+    const selectedAssets = [...catalog.assets.entries()]
+      .filter(([asset]) => matchesMarketClass(asset, parsedQuery.data.marketClass));
+    const definitions = selectedAssets.flatMap(([asset, venues]) => venues.map((entry) => ({
+      symbol: entry.symbol,
+      venue: entry.venue as MarketDefinition['venue'],
+      asset,
+    })));
+    const subscribeEquityGroup = parsedQuery.data.marketClass === 'hong_kong' || parsedQuery.data.marketClass === 'china_a';
+    if (subscribeEquityGroup && definitions.length > 0 && !marketHub.ensureMarkets(definitions)) {
+      request.log.warn({ count: definitions.length, marketClass: parsedQuery.data.marketClass }, 'arbitrage market stream budget exhausted');
+    }
+    void fundingOverviewService.ensureFresh().catch((error: unknown) => {
+      request.log.warn({ reason: error instanceof PublicMarketDataError ? error.code : 'PUBLIC_DATA_ERROR' }, 'arbitrage funding refresh failed');
+    });
+    const funding = fundingOverviewService.buildResponse(catalog);
+    let fees: VenueFeeRatesResponse['fees'] = feeCache?.fees ?? [];
+    if (!feeCache) void loadFeeRates().catch((error: unknown) => {
+      request.log.warn({ reason: error instanceof GateApiError ? error.label : error instanceof TradingRuntimeError ? error.code : 'LOCAL_CREDENTIAL_ERROR' }, 'arbitrage fee enrichment unavailable');
+    });
+    const response = buildArbitrageOpportunities(marketHub.snapshot(), funding, fees, {
+      notionalPerLegUsd: parsedQuery.data.notional,
+      leverage: parsedQuery.data.leverage,
+      holdingHours: parsedQuery.data.holdingHours,
+      limit: parsedQuery.data.limit,
+      marketClass: parsedQuery.data.marketClass,
+    });
+    response.opportunities = response.opportunities.filter((opportunity) => matchesMarketClass(opportunity.asset, parsedQuery.data.marketClass));
+    const liveMarkets = new Map(marketHub.snapshot().markets.map((market) => [market.symbol, market]));
+    response.coverage = selectedAssets.map(([asset, venues]) => ({
+      asset,
+      marketClass: marketClassOf(asset),
+      venues: venues.map((venue) => venue.venue),
+      streamed: marketHub.hasAsset(asset),
+      arbitrageEligible: venues.length >= 2,
+      quotes: venues.map((venue) => {
+        const market = liveMarkets.get(venue.symbol);
+        const live = market?.source === 'gate_crossex_websocket';
+        return {
+          venue: venue.venue,
+          symbol: venue.symbol,
+          lastPrice: live ? market.lastPrice : null,
+          bidPrice: live ? market.bidPrice : null,
+          askPrice: live ? market.askPrice : null,
+          updatedAt: live ? market.updatedAt : null,
+          live,
+        };
+      }),
+    }));
+    return response satisfies ArbitrageOpportunitiesResponse;
+  });
+
   app.post('/api/markets/funding-history', {
     preHandler: async (request, reply) => {
       if (request.headers['x-gct-read-intent'] !== 'funding-history') {
@@ -2123,41 +2313,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (feeCache && Date.now() - Date.parse(feeCache.fetchedAt) < 10 * 60_000) {
       return { fees: feeCache.fees, fetchedAt: feeCache.fetchedAt, cacheStatus: 'fresh' } satisfies VenueFeeRatesResponse;
     }
-    const tradingGateway = crossExGateway as Partial<TradingCrossExGateway>;
-    if (!tradingGateway.queryFeeRates) return reply.code(503).send({ error: 'fee_rates_unavailable' });
     try {
-      if (feeFetchInFlight?.generation !== credentialGeneration) {
-        const refreshCredentialGeneration = credentialGeneration;
-        const pending = (async () => {
-          let credentials: GateCredentials | null = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-          try {
-            if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
-            const rates = await tradingGateway.queryFeeRates!(credentials);
-            if (refreshCredentialGeneration !== credentialGeneration) {
-              throw new TradingRuntimeError('credential_context_changed', 409);
-            }
-            const fetchedAt = new Date().toISOString();
-            const fees = rates.map((rate) => ({
-              venue: rate.exchange_type, spotMakerFee: rate.spot_maker_fee, spotTakerFee: rate.spot_taker_fee,
-              futureMakerFee: rate.future_maker_fee, futureTakerFee: rate.future_taker_fee,
-              specialFees: (rate.special_fee_list ?? []).map((special) => ({
-                symbol: special.symbol,
-                makerFee: special.maker_fee_rate,
-                takerFee: special.taker_fee_rate,
-              })),
-            }));
-            feeCache = { fees, fetchedAt };
-            return { fees, fetchedAt };
-          } finally {
-            credentials = null;
-          }
-        })();
-        const completed = pending.finally(() => {
-          if (feeFetchInFlight?.promise === completed) feeFetchInFlight = null;
-        });
-        feeFetchInFlight = { generation: refreshCredentialGeneration, promise: completed };
-      }
-      const refreshed = await feeFetchInFlight.promise;
+      const refreshed = await loadFeeRates();
       return { ...refreshed, cacheStatus: 'fresh' } satisfies VenueFeeRatesResponse;
     } catch (error) {
       if (requestCredentialGeneration !== credentialGeneration) {

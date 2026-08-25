@@ -438,8 +438,9 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const [makerLeg, setMakerLeg] = useState<'left' | 'right'>('left');
   const [amount, setAmount] = useState('');
   const [positionOrderQuantity, setPositionOrderQuantity] = useState('');
-  const [threshold, setThreshold] = useState('0');
-  const [takeProfitThreshold, setTakeProfitThreshold] = useState('0.4');
+  const [threshold, setThreshold] = useState(prefill?.entryBps ?? '0');
+  const [takeProfitThreshold, setTakeProfitThreshold] = useState(prefill?.takeProfitBps ?? '0.4');
+  const [emergencyStopThreshold, setEmergencyStopThreshold] = useState(prefill?.emergencyStopBps ?? '50');
   const [maxPosition, setMaxPosition] = useState('');
   const [orderQuantity, setOrderQuantity] = useState('');
   const [leftLeverage, setLeftLeverage] = useState('1');
@@ -687,7 +688,8 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
   const sizeInputsValid = isPositiveDecimal(configuredPerOrder)
     && isPositiveDecimal(mode === 'position' ? amount : maxPosition)
     && entryThresholdValid
-    && (mode === 'position' || (isPositiveDecimal(takeProfitThreshold) && Number(takeProfitThreshold) < Number(threshold)))
+    && (mode === 'position' || (isPositiveDecimal(takeProfitThreshold) && Number(takeProfitThreshold) < Number(threshold)
+      && isPositiveDecimal(emergencyStopThreshold) && Number(emergencyStopThreshold) > Number(threshold)))
     && instrumentsReady
     && sizeIssues.length === 0;
   const strategyInputsValid = sizeInputsValid && !marginInsufficient
@@ -774,7 +776,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
       ...(executionMethod === 'Maker–Taker' ? { makerLeg } : {}),
       ...(mode === 'position'
         ? { totalAmount: amount, leftLeverage, rightLeverage }
-        : { maxPosition, takeProfitBps: takeProfitThreshold }),
+        : { maxPosition, takeProfitBps: takeProfitThreshold, emergencyStopBps: emergencyStopThreshold }),
     };
     try {
       const record = await api.startStrategy(config);
@@ -816,7 +818,7 @@ export function StrategyView({ mode, prefill, marketSnapshot, catalog, fees, str
           tradingMode={tradingMode} disabled={reduceOnly} onOpenModeDialog={onOpenModeDialog} onValueChange={setRightLeverage} onRiskLimitChange={setRightRiskPositionValue} />
         <label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label>
         <label className="reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Position handling')}</span><div><input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} /><b>{t('Reduce only')}</b></div></label>
-      </> : <><label><span>{t('Order quantity')}</span><div><input placeholder="e.g. 0.05" value={orderQuantity} onChange={(event) => setOrderQuantity(event.target.value)} /><b>{asset}</b></div></label><label><span>{t('Max position')}</span><div><input placeholder="e.g. 2.00" value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} /><b>{asset}</b></div></label><label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label></>}</div>
+      </> : <><label><span>{t('Order quantity')}</span><div><input placeholder="e.g. 0.05" value={orderQuantity} onChange={(event) => setOrderQuantity(event.target.value)} /><b>{asset}</b></div></label><label><span>{t('Max position')}</span><div><input placeholder="e.g. 2.00" value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} /><b>{asset}</b></div></label><label><span>{t('Entry threshold')}</span><div><input value={threshold} onChange={(event) => setThreshold(event.target.value)} /><b>bps</b></div></label><label><span>{t('Take-profit threshold')}</span><div><input value={takeProfitThreshold} onChange={(event) => setTakeProfitThreshold(event.target.value)} /><b>bps</b></div></label><label><span>异常扩张止损</span><div><input value={emergencyStopThreshold} onChange={(event) => setEmergencyStopThreshold(event.target.value)} /><b>bps</b></div></label></>}</div>
       {instrumentsReady && <div className={`strategy-size-check ${sizeInputsValid ? 'valid' : 'invalid'}`}><span>{sizeInputsValid ? '✓' : '!'}</span><p>{sizeInputsValid
         ? t('Per-order quantity meets both exchange minimums')
         : sizeIssues.join(' · ') || t('Enter valid strategy amounts')}</p></div>}

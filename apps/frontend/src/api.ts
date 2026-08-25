@@ -1,5 +1,6 @@
 import {
   AuthenticatedPortfolioSnapshotSchema,
+  ArbitrageOpportunitiesResponseSchema,
   BorosStrategiesResponseSchema,
   CandleSeriesResponseSchema,
   CredentialConnectionStatusSchema,
@@ -30,6 +31,8 @@ import {
   UserPreferencesResponseSchema,
   VenueFeeRatesResponseSchema,
   type AuthenticatedPortfolioSnapshot,
+  type ArbitrageOpportunity,
+  type ArbitrageOpportunitiesResponse,
   type BorosStrategy,
   type BorosStrategyMarket,
   type BorosStrategiesResponse,
@@ -84,6 +87,8 @@ import {
 
 export type {
   AuthenticatedPortfolioSnapshot,
+  ArbitrageOpportunity,
+  ArbitrageOpportunitiesResponse,
   BorosStrategy,
   BorosStrategyMarket,
   BorosStrategiesResponse,
@@ -264,6 +269,16 @@ function cachedRead<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> 
 
 export const api = {
   markets: () => request(MarketSnapshotSchema, '/api/markets'),
+  arbitrageOpportunities: (options: { notional: number; leverage: number; holdingHours: number; limit?: number; marketClass?: 'all' | 'crypto' | 'hong_kong' | 'china_a' }) => {
+    const params = new URLSearchParams({
+      notional: String(options.notional),
+      leverage: String(options.leverage),
+      holdingHours: String(options.holdingHours),
+      limit: String(options.limit ?? 100),
+      marketClass: options.marketClass ?? 'all',
+    });
+    return request(ArbitrageOpportunitiesResponseSchema, `/api/arbitrage/opportunities?${params}`);
+  },
   borosStrategies: () => request(BorosStrategiesResponseSchema, '/api/boros/strategies'),
   marketCatalog: () => request(MarketCatalogResponseSchema, '/api/markets/catalog'),
   publicMarketSnapshot: (symbol: string) => request(PublicMarketSnapshotResponseSchema, `/api/crossex/instruments/${encodeURIComponent(symbol)}/market-snapshot`),

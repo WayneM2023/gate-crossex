@@ -15,6 +15,7 @@ const MAX_CANDLES = 500;
 const MAX_TRADES = 80;
 const MAX_BOOK_LEVELS = 50;
 const BOOK_EMIT_INTERVAL_MS = 200;
+const DEFAULT_ORDER_BOOK_IDLE_MS = 90_000;
 const MAX_SYMBOLS_PER_SUBSCRIPTION = 100;
 const DYNAMIC_MARKET_IDLE_MS = 30 * 60_000;
 const DYNAMIC_MARKET_SWEEP_MS = 5 * 60_000;
@@ -189,6 +190,7 @@ export class CrossExMarketHub {
   private readonly tradeWatchers = new Map<string, number>();
   private readonly klineWatchers = new Map<string, number>();
   private readonly books = new Map<string, BookState>();
+  private readonly bookIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly trades = new Map<string, PublicTrade[]>();
   private readonly candleSeries = new Map<string, Candle[]>();
   private readonly tradeSymbolAliases = new Map<string, string>();
@@ -199,14 +201,21 @@ export class CrossExMarketHub {
   private readonly heartbeatIntervalMs: number;
   private readonly marketIdlePingAfterMs: number;
   private readonly staleAfterMs: number;
+  private readonly orderBookIdleMs: number;
 
   constructor(
     private readonly url: string,
-    options: { heartbeatIntervalMs?: number; marketIdlePingAfterMs?: number; staleAfterMs?: number } = {},
+    options: {
+      heartbeatIntervalMs?: number;
+      marketIdlePingAfterMs?: number;
+      staleAfterMs?: number;
+      orderBookIdleMs?: number;
+    } = {},
   ) {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 25_000;
     this.marketIdlePingAfterMs = options.marketIdlePingAfterMs ?? 2_000;
     this.staleAfterMs = options.staleAfterMs ?? 60_000;
+    this.orderBookIdleMs = options.orderBookIdleMs ?? DEFAULT_ORDER_BOOK_IDLE_MS;
     MARKET_ASSETS.forEach((asset, assetIndex) => MARKET_VENUES.forEach((venue, venueIndex) => {
       const market = seedMarket(venue, asset, venueIndex, assetIndex);
       this.markets.set(market.symbol, market);
@@ -233,6 +242,8 @@ export class CrossExMarketHub {
       if (book.emitTimer) clearTimeout(book.emitTimer);
       book.emitTimer = null;
     }
+    for (const timer of this.bookIdleTimers.values()) clearTimeout(timer);
+    this.bookIdleTimers.clear();
     this.socket?.close();
     this.socket = null;
     this.state = 'disconnected';
@@ -343,11 +354,29 @@ export class CrossExMarketHub {
   }
 
   watchOrderBook(symbol: string): () => void {
+    const key = `order_book_update:${symbol}`;
+    const idleTimer = this.bookIdleTimers.get(key);
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      this.bookIdleTimers.delete(key);
+    }
     return this.watch(this.bookWatchers, 'order_book_update', symbol, () => {
-      const book = this.books.get(symbol);
-      if (book?.emitTimer) clearTimeout(book.emitTimer);
-      this.books.delete(symbol);
-    });
+      // HTTP consumers poll in batches. Retaining the subscription across the normal
+      // polling interval avoids a cold subscribe for every request and keeps a coherent
+      // incremental book instead of repeatedly waiting for a new snapshot frame.
+      this.bookWatchers.set(key, 0);
+      const timer = setTimeout(() => {
+        this.bookIdleTimers.delete(key);
+        if ((this.bookWatchers.get(key) ?? 0) > 0) return;
+        this.bookWatchers.delete(key);
+        this.unsubscribeSymbols('order_book_update', [symbol]);
+        const book = this.books.get(symbol);
+        if (book?.emitTimer) clearTimeout(book.emitTimer);
+        this.books.delete(symbol);
+      }, this.orderBookIdleMs);
+      timer.unref?.();
+      this.bookIdleTimers.set(key, timer);
+    }, false);
   }
 
   /** Keep dynamically discovered ticker markets registered while a client displays them. */
@@ -381,7 +410,10 @@ export class CrossExMarketHub {
     return this.watch(this.klineWatchers, `kline_${interval}`, symbol, () => undefined);
   }
 
-  private watch(watchers: Map<string, number>, channel: string, symbol: string, onRelease: () => void): () => void {
+  private watch(
+    watchers: Map<string, number>, channel: string, symbol: string, onRelease: () => void,
+    deleteBeforeRelease = true,
+  ): () => void {
     const key = `${channel}:${symbol}`;
     const current = watchers.get(key) ?? 0;
     watchers.set(key, current + 1);
@@ -395,8 +427,10 @@ export class CrossExMarketHub {
         watchers.set(key, count);
         return;
       }
-      watchers.delete(key);
-      this.unsubscribeSymbols(channel, [symbol]);
+      if (deleteBeforeRelease) {
+        watchers.delete(key);
+        this.unsubscribeSymbols(channel, [symbol]);
+      }
       onRelease();
     };
   }

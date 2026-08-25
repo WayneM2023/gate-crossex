@@ -1,0 +1,35 @@
+[Unit]
+Description=Gate CrossEx read-only market data service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gate-crossex
+Environment=NODE_ENV=production
+Environment=GCT_HOST=127.0.0.1
+Environment=GCT_PORT=17840
+Environment=GCT_NO_OPEN=1
+Environment=GCT_DISABLE_OS_KEYCHAIN=1
+Environment=GCT_FORCE_READONLY=1
+Environment=GCT_DATA_DIR=/opt/gate-crossex/.local-data
+Environment=GCT_CREDENTIAL_ENV_PATH=/opt/gate-crossex/.local-data/disabled-credentials.env
+Environment=SPREAD_MONITOR_URL=http://127.0.0.1:17841/overview
+ExecStart=/opt/gate-crossex/.runtime/bin/node /opt/gate-crossex/apps/backend/dist/server.js
+Restart=always
+RestartSec=5
+MemoryHigh=256M
+MemoryMax=384M
+CPUQuota=75%
+TasksMax=128
+User=crossex
+Group=crossex
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gate-crossex/.local-data /opt/gate-crossex/logs
+
+[Install]
+WantedBy=multi-user.target

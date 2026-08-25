@@ -1025,6 +1025,45 @@ describe('strategy engine', () => {
     expect(strategy.filledRight).toBe('0');
   });
 
+  it('requires three synchronized adverse quotes before an emergency reduce-only exit', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100150', '100151');
+    markets.set('OKX_FUTURE_BTC_USDT', '99999', '100000');
+    const record = await engine.startStrategy({
+      kind: 'auto', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
+      entryBps: '10', takeProfitBps: '2', emergencyStopBps: '20', maxPosition: '0.1', perOrderQuantity: '0.1',
+      reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    });
+    const entryTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 2);
+    ackOrder(runtime, 'remote-1', 'FILLED', '0.1', '100150');
+    ackOrder(runtime, 'remote-2', 'FILLED', '0.1', '100000');
+    await entryTick;
+    await waitFor(() => runtime.getStrategy(record.id).openPosition === '0.1');
+
+    const adverseAt = Date.now();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100299', '100300', new Date(adverseAt).toISOString());
+    markets.set('OKX_FUTURE_BTC_USDT', '100000', '100001', new Date(adverseAt).toISOString());
+    await engine.tick();
+    // Re-evaluating the same quote pair must not count as another confirmation.
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(2);
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100299', '100300', new Date(adverseAt + 1).toISOString());
+    markets.set('OKX_FUTURE_BTC_USDT', '100000', '100001', new Date(adverseAt + 1).toISOString());
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(2);
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100299', '100300', new Date(adverseAt + 2).toISOString());
+    markets.set('OKX_FUTURE_BTC_USDT', '100000', '100001', new Date(adverseAt + 2).toISOString());
+    const stopTick = engine.tick();
+    await waitFor(() => gateway.createdOrders.length === 4);
+    expect(gateway.createdOrders.slice(2).every((order) => order.reduce_only === 'true')).toBe(true);
+    ackOrder(runtime, 'remote-3', 'FILLED', '0.1', '100300');
+    ackOrder(runtime, 'remote-4', 'FILLED', '0.1', '100000');
+    await stopTick;
+    expect(runtime.strategyLogs(record.id).some((log) => log.event === 'Emergency stop Executed')).toBe(true);
+    expect(runtime.getStrategy(record.id).status).toBe('PAUSED');
+  });
+
   it('cancels resting maker quotes when a strategy is stopped', async () => {
     const { engine, gateway, markets } = await createHarness();
     markets.set('BINANCE_FUTURE_BTC_USDT', '100000', '100001');
